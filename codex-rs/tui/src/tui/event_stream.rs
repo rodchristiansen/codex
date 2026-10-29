@@ -27,6 +27,7 @@ use std::task::Context;
 use std::task::Poll;
 
 use crossterm::event::Event;
+use crossterm::event::TerminalEvent;
 use tokio::sync::broadcast;
 use tokio::sync::watch;
 use tokio_stream::Stream;
@@ -44,6 +45,14 @@ pub type EventResult = std::io::Result<Event>;
 /// Value in production is [`CrosstermEventSource`].
 pub trait EventSource: Send + 'static {
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<EventResult>>;
+
+    fn poll_terminal_event(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<std::io::Result<TerminalEvent>>> {
+        self.poll_next(cx)
+            .map(|event| event.map(|event| event.map(TerminalEvent::Input)))
+    }
 }
 
 /// Shared crossterm input state for all [`TuiEventStream`] instances. A single crossterm EventStream
@@ -52,6 +61,8 @@ pub trait EventSource: Send + 'static {
 /// This intermediate layer enables dropping/recreating the underlying EventStream (pause/resume) without rebuilding consumers.
 pub struct EventBroker<S: EventSource = CrosstermEventSource> {
     state: Mutex<EventBrokerState<S>>,
+    palette: Mutex<super::palette_refresh::PaletteRefresh>,
+    refresh_palette_on_start: AtomicBool,
     resume_events_tx: watch::Sender<()>,
     pub(super) size_monitor: Option<SizeMonitor>,
 }
@@ -85,6 +96,8 @@ impl<S: EventSource + Default> EventBroker<S> {
         let (resume_events_tx, _resume_events_rx) = watch::channel(());
         Self {
             state: Mutex::new(EventBrokerState::Start),
+            palette: Mutex::new(super::palette_refresh::PaletteRefresh::default()),
+            refresh_palette_on_start: AtomicBool::new(false),
             resume_events_tx,
             size_monitor: None,
         }
@@ -100,6 +113,10 @@ impl<S: EventSource + Default> EventBroker<S> {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         *state = EventBrokerState::Paused;
+        self.palette
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .cancel();
     }
 
     /// Create a new instance of the underlying event source
@@ -112,6 +129,7 @@ impl<S: EventSource + Default> EventBroker<S> {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         *state = EventBrokerState::Start;
+        self.refresh_palette_on_start.store(true, Ordering::Relaxed);
         let _ = self.resume_events_tx.send(());
     }
 
@@ -127,13 +145,16 @@ impl<S: EventSource + Default> EventBroker<S> {
 /// Real crossterm-backed event source.
 pub struct CrosstermEventSource {
     #[cfg(not(windows))]
-    events: crossterm::event::EventStream,
+    events: crossterm::event::TerminalEventStream,
     #[cfg(windows)]
     events: super::windows_key_sequence::WindowsKeySequence<crossterm::event::EventStream>,
 }
 
 impl Default for CrosstermEventSource {
     fn default() -> Self {
+        #[cfg(not(windows))]
+        let events = crossterm::event::TerminalEventStream::new();
+        #[cfg(windows)]
         let events = crossterm::event::EventStream::new();
         Self {
             #[cfg(not(windows))]
@@ -151,6 +172,21 @@ impl EventSource for CrosstermEventSource {
         #[cfg(windows)]
         let _ = super::windows_console::ensure_input_record_mode();
 
+        #[cfg(not(windows))]
+        let mut source = self;
+        #[cfg(not(windows))]
+        loop {
+            match source.as_mut().poll_terminal_event(cx) {
+                Poll::Ready(Some(Ok(TerminalEvent::Input(event)))) => {
+                    return Poll::Ready(Some(Ok(event)));
+                }
+                Poll::Ready(Some(Ok(_))) => continue,
+                Poll::Ready(Some(Err(err))) => return Poll::Ready(Some(Err(err))),
+                Poll::Ready(None) => return Poll::Ready(None),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+        #[cfg(windows)]
         let result = Pin::new(&mut self.get_mut().events).poll_next(cx);
 
         // EventStream starts its blocking reader before returning Pending, so reassert the mode
@@ -160,7 +196,18 @@ impl EventSource for CrosstermEventSource {
             let _ = super::windows_console::ensure_input_record_mode();
         }
 
-        result
+        #[cfg(windows)]
+        {
+            result
+        }
+    }
+
+    #[cfg(not(windows))]
+    fn poll_terminal_event(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<std::io::Result<TerminalEvent>>> {
+        Pin::new(&mut self.get_mut().events).poll_next(cx)
     }
 }
 
@@ -220,6 +267,15 @@ impl<S: EventSource + Default + Unpin> TuiEventStream<S> {
                     .state
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
+                #[cfg(unix)]
+                if matches!(*state, EventBrokerState::Start)
+                    && self
+                        .broker
+                        .refresh_palette_on_start
+                        .swap(false, Ordering::Relaxed)
+                {
+                    self.request_palette_refresh();
+                }
                 let events = match state.active_event_source_mut() {
                     Some(events) => events,
                     None => {
@@ -232,7 +288,7 @@ impl<S: EventSource + Default + Unpin> TuiEventStream<S> {
                         }
                     }
                 };
-                match Pin::new(events).poll_next(cx) {
+                match Pin::new(events).poll_terminal_event(cx) {
                     Poll::Ready(Some(Ok(event))) => Some(event),
                     Poll::Ready(Some(Err(_))) | Poll::Ready(None) => {
                         *state = EventBrokerState::Start;
@@ -250,8 +306,50 @@ impl<S: EventSource + Default + Unpin> TuiEventStream<S> {
                 }
             };
 
-            if let Some(mapped) = poll_result.and_then(|event| self.map_crossterm_event(event)) {
+            if let Some(mapped) = poll_result.and_then(|event| self.map_terminal_event(event)) {
                 return Poll::Ready(Some(mapped));
+            }
+        }
+    }
+
+    fn request_palette_refresh(&self) {
+        #[cfg(unix)]
+        {
+            let mut palette = self
+                .broker
+                .palette
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            #[cfg(not(test))]
+            let mut output = std::io::stdout();
+            #[cfg(test)]
+            let mut output = std::io::sink();
+            if let Err(err) = palette.request(&mut output, std::time::Instant::now()) {
+                tracing::debug!(%err, "failed to request terminal palette");
+            }
+        }
+    }
+
+    fn map_terminal_event(&mut self, event: TerminalEvent) -> Option<TuiEvent> {
+        match event {
+            TerminalEvent::Input(event) => self.map_crossterm_event(event),
+            TerminalEvent::ColorSchemeChanged { .. } => {
+                self.request_palette_refresh();
+                None
+            }
+            TerminalEvent::DefaultColor { slot, rgb } => {
+                let colors = self
+                    .broker
+                    .palette
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .accept(slot, rgb, std::time::Instant::now())?;
+                if crate::terminal_palette::update_default_colors(colors) {
+                    crate::render::highlight::invalidate_rendered_content();
+                    Some(TuiEvent::Draw)
+                } else {
+                    None
+                }
             }
         }
     }
@@ -304,8 +402,7 @@ impl<S: EventSource + Default + Unpin> TuiEventStream<S> {
             Event::Paste(pasted) => Some(TuiEvent::Paste(pasted)),
             Event::FocusGained => {
                 self.terminal_focused.store(true, Ordering::Relaxed);
-                // Keep the startup-cached palette: querying terminal colors here blocks the
-                // input loop, and a direct probe would discard keys typed during the refresh.
+                self.request_palette_refresh();
                 Some(TuiEvent::FocusGained)
             }
             Event::FocusLost => {
@@ -526,6 +623,88 @@ mod tests {
             Some(TuiEvent::Key(key)) => assert_eq!(key, expected_key),
             other => panic!("expected queued key event, got {other:?}"),
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn palette_refresh_redraws_without_replacing_syntax_theme_or_consuming_paste() {
+        let (broker, handle, _draw_tx, draw_rx, terminal_focused) = setup();
+        let mut stream = make_stream(broker, draw_rx, terminal_focused);
+        let paste = "draft with \x1b[?997;2n literal report";
+        handle.send(Ok(Event::Paste(paste.into())));
+        let syntax_theme = crate::render::highlight::current_syntax_theme();
+        crate::terminal_palette::with_test_default_colors(
+            Some(crate::terminal_probe::DefaultColors {
+                fg: (0, 0, 0),
+                bg: (255, 255, 255),
+            }),
+            || {
+                let revision = crate::render::highlight::syntax_theme_revision();
+                assert!(
+                    stream
+                        .map_terminal_event(TerminalEvent::ColorSchemeChanged { dark: true })
+                        .is_none()
+                );
+                assert!(
+                    stream
+                        .map_terminal_event(TerminalEvent::DefaultColor {
+                            slot: 10,
+                            rgb: Some((255, 255, 255))
+                        })
+                        .is_none()
+                );
+                assert_eq!(crate::terminal_palette::default_bg(), Some((255, 255, 255)));
+                assert!(matches!(
+                    stream.map_terminal_event(TerminalEvent::DefaultColor {
+                        slot: 11,
+                        rgb: Some((0, 0, 0))
+                    }),
+                    Some(TuiEvent::Draw)
+                ));
+                assert_eq!(crate::terminal_palette::default_bg(), Some((0, 0, 0)));
+                assert_eq!(crate::terminal_palette::default_fg(), Some((255, 255, 255)));
+                assert_eq!(
+                    crate::render::highlight::syntax_theme_revision(),
+                    revision.wrapping_add(1)
+                );
+                assert_eq!(
+                    crate::render::highlight::current_syntax_theme(),
+                    syntax_theme
+                );
+                assert_eq!(
+                    crate::style::user_message_style().bg,
+                    Some(crate::terminal_palette::rgb_color((30, 30, 30)))
+                );
+                assert!(
+                    stream
+                        .map_terminal_event(TerminalEvent::ColorSchemeChanged { dark: false })
+                        .is_none()
+                );
+                assert!(
+                    stream
+                        .map_terminal_event(TerminalEvent::DefaultColor {
+                            slot: 11,
+                            rgb: Some((255, 255, 255))
+                        })
+                        .is_none()
+                );
+                assert!(matches!(
+                    stream.map_terminal_event(TerminalEvent::DefaultColor {
+                        slot: 10,
+                        rgb: Some((0, 0, 0))
+                    }),
+                    Some(TuiEvent::Draw)
+                ));
+                assert_eq!(
+                    crate::style::user_message_style().bg,
+                    Some(crate::terminal_palette::rgb_color((244, 244, 244)))
+                );
+                assert_eq!(
+                    crate::render::highlight::current_syntax_theme(),
+                    syntax_theme
+                );
+            },
+        );
+        assert!(matches!(stream.next().await, Some(TuiEvent::Paste(actual)) if actual == paste));
     }
 
     #[tokio::test(flavor = "current_thread")]

@@ -272,6 +272,11 @@ pub(crate) fn set_syntax_theme(theme: Theme) {
         Err(poisoned) => poisoned.into_inner(),
     };
     *guard = theme;
+    invalidate_rendered_content();
+}
+
+/// Terminal palette changes invalidate painted content without replacing a chosen syntax theme.
+pub(crate) fn invalidate_rendered_content() {
     #[cfg(not(test))]
     THEME_REVISION.fetch_add(1, Ordering::Release);
     #[cfg(test)]
