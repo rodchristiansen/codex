@@ -81,6 +81,7 @@ mod notification_preview;
 #[cfg(test)]
 #[path = "tui/owned_screen_tests.rs"]
 mod owned_screen_tests;
+mod palette_refresh;
 #[cfg(all(test, unix))]
 #[path = "tui_panic_tests.rs"]
 mod panic_tests;
@@ -273,6 +274,8 @@ fn set_modes() -> Result<tmux::Options> {
 
     #[cfg(not(windows))]
     let _ = execute!(stdout(), EnableFocusChange);
+    #[cfg(unix)]
+    let _ = palette_refresh::set_reporting(&mut stdout(), /*enabled*/ true);
     #[cfg(windows)]
     let _ = execute!(stdout(), DisableFocusChange);
     Ok(options)
@@ -364,6 +367,8 @@ fn restore_common(
         first_error.get_or_insert(err);
     }
     let _ = execute!(stdout(), DisableFocusChange);
+    #[cfg(unix)]
+    let _ = palette_refresh::set_reporting(&mut stdout(), /*enabled*/ false);
     if raw_mode_restore == RawModeRestore::DrainAndDisable {
         #[cfg(unix)]
         if let Err(err) = crate::terminal_probe::wait_for_exit_reports() {
@@ -413,7 +418,9 @@ pub fn restore() -> Result<()> {
 #[cfg(unix)]
 pub(super) fn reapply_raw_mode_after_resume() -> Result<()> {
     disable_raw_mode()?;
-    enable_raw_mode()
+    enable_raw_mode()?;
+    let _ = palette_refresh::set_reporting(&mut stdout(), /*enabled*/ true);
+    Ok(())
 }
 
 /// Restore the terminal after Codex is exiting.

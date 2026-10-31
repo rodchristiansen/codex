@@ -72,6 +72,7 @@ impl SuspendContext {
         if let Err(err) = crate::terminal_program_status::clear_terminal_program_status() {
             tracing::debug!(error = %err, "failed to clear terminal program status before suspend");
         }
+        let _ = super::palette_refresh::set_reporting(&mut stdout(), /*enabled*/ false);
         let suspend_result = suspend_process();
         crate::terminal_program_status::invalidate_terminal_program_status();
         suspend_result?;
