@@ -88,7 +88,7 @@ fn best_color_for_color_level(target: (u8, u8, u8), color_level: StdoutColorLeve
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DefaultColors {
     fg: (u8, u8, u8),
     bg: (u8, u8, u8),
@@ -108,6 +108,24 @@ pub fn default_colors() -> Option<DefaultColors> {
     }
 
     imp::default_colors()
+}
+
+/// Publish a complete runtime palette without ever probing stdin from the render path.
+pub(crate) fn update_default_colors(colors: crate::terminal_probe::DefaultColors) -> bool {
+    let next = DefaultColors {
+        fg: colors.fg,
+        bg: colors.bg,
+    };
+    #[cfg(test)]
+    {
+        if default_colors() == Some(next) {
+            return false;
+        }
+        TEST_DEFAULT_COLORS.with(|colors| colors.set(Some(Some(next))));
+        true
+    }
+    #[cfg(not(test))]
+    imp::update_default_colors(next)
 }
 
 /// Scope a terminal palette (or its absence) to the current test thread while rendering a widget.
@@ -196,6 +214,18 @@ mod imp {
         }
     }
 
+    pub(super) fn update_default_colors(colors: DefaultColors) -> bool {
+        let Ok(mut cache) = default_colors_cache().lock() else {
+            return false;
+        };
+        if cache.value == Some(colors) {
+            return false;
+        }
+        cache.value = Some(colors);
+        cache.attempted = true;
+        true
+    }
+
     /// Queries terminal default colors through the bounded startup probe path.
     ///
     /// The palette cache treats `None` as an attempted-but-unavailable result, so this function
@@ -218,6 +248,11 @@ mod imp {
 
     pub(super) fn default_colors() -> Option<DefaultColors> {
         None
+    }
+
+    #[cfg(not(test))]
+    pub(super) fn update_default_colors(_colors: DefaultColors) -> bool {
+        false
     }
 
     #[cfg(any(unix, windows))]
