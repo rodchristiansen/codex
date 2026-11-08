@@ -727,6 +727,59 @@ async fn rate_limit_warnings_emit_thresholds() {
 }
 
 #[tokio::test]
+async fn rate_limit_warnings_opt_out_preserves_limit_errors() {
+    let (mut chat, mut rx, _) = make_chatwidget_manual(None).await;
+    chat.local_settings.notices.hide_rate_limit_warnings = Some(true);
+    let mut usage = snapshot(100.0);
+    usage.rate_limit_reached_type = Some(RateLimitReachedType::WorkspaceOwnerUsageLimitReached);
+    chat.on_rate_limit_snapshot(Some(usage));
+    assert!(drain_insert_history_transcript(&mut rx).is_empty());
+
+    chat.on_rate_limit_error(
+        RateLimitErrorKind::UsageLimit,
+        "Usage limit reached.".to_string(),
+    );
+    let errors = lines_to_single_string(&drain_insert_history(&mut rx).concat());
+    assert!(
+        errors.contains("You've reached your usage limit"),
+        "{errors}"
+    );
+}
+
+#[tokio::test]
+async fn rate_limit_warnings_opt_out_preserves_status_across_sessions() {
+    for hidden in [None, Some(false), Some(true)] {
+        for _session in 0..2 {
+            let (mut chat, mut rx, _) = make_chatwidget_manual(Some("gpt-5")).await;
+            chat.local_settings.notices.hide_rate_limit_warnings = hidden;
+            for used_percent in [75, 90, 95] {
+                let mut usage = snapshot(f64::from(used_percent));
+                usage.secondary = Some(RateLimitWindow {
+                    used_percent,
+                    window_duration_mins: Some(10080),
+                    resets_at: None,
+                });
+                chat.on_rate_limit_snapshot(Some(usage.clone()));
+                let warnings = drain_insert_history_transcript(&mut rx);
+                assert_eq!(warnings.len(), if hidden == Some(true) { 0 } else { 2 });
+                assert_eq!(chat.usage_notice(120).is_none(), hidden == Some(true));
+                assert!(!chat.rate_limit_snapshots_by_limit_id.is_empty());
+
+                chat.on_rolling_rate_limit_snapshot(usage);
+                assert!(drain_insert_history_transcript(&mut rx).is_empty());
+                assert_eq!(chat.usage_notice(120).is_none(), hidden == Some(true));
+            }
+            chat.dispatch_command(SlashCommand::Status);
+            let status = lines_to_single_string(&drain_insert_history_transcript(&mut rx).concat());
+            assert!(
+                status.contains("5%"),
+                "usage should remain visible in /status: {status}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn rate_limit_usage_warnings_early_threshold_is_scoped_and_deduplicated() {
     for (plan_type, window_minutes, should_warn_early) in [
         (Some(PlanType::Plus), Some(300), true),
