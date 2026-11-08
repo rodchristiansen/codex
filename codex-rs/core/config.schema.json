@@ -3796,7 +3796,7 @@
           "type": "boolean"
         },
         "hide_rate_limit_warnings": {
-          "description": "Hide proactive usage-limit announcements and the persistent quota banner.\nUsage remains available through /status; request-blocking errors are unaffected.",
+          "description": "Hide proactive usage-limit announcements and the persistent quota banner. Usage remains available through /status; request-blocking errors are unaffected.",
           "type": "boolean"
         },
         "hide_world_writable_warning": {
