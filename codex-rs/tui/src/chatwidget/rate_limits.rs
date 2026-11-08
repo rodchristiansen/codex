@@ -325,7 +325,13 @@ impl ChatWidget {
                     RateLimitSwitchPromptState::Idle => {}
                 }
             }
-            let should_warn_about_rate_limit_usage = is_codex_limit && !has_workspace_credits;
+            let should_warn_about_rate_limit_usage = is_codex_limit
+                && !has_workspace_credits
+                && !self
+                    .local_settings
+                    .notices
+                    .hide_rate_limit_warnings
+                    .unwrap_or(false);
             let warnings = if should_warn_about_rate_limit_usage {
                 self.rate_limit_warnings.take_warnings(
                     self.plan_type,
@@ -393,7 +399,7 @@ impl ChatWidget {
 
             if !warnings.is_empty() {
                 for warning in warnings {
-                    self.add_to_history(history_cell::new_usage_warning_event(warning));
+                    self.add_to_history(history_cell::new_visible_warning_event(warning));
                 }
                 self.request_redraw();
             }
