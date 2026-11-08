@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
+use super::footer_content::FooterContent;
 use codex_protocol::ThreadId;
-use ratatui::text::Line;
 
 use super::status_line_from_segments;
 use super::status_line_setup::StatusLineItem;
@@ -137,6 +137,7 @@ struct PreviewValue {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct StatusSurfacePreviewData {
     pub(crate) thread_id: Option<ThreadId>,
+    pub(crate) pull_request_url: Option<String>,
     values: BTreeMap<StatusSurfacePreviewItem, PreviewValue>,
 }
 
@@ -144,6 +145,7 @@ impl Default for StatusSurfacePreviewData {
     fn default() -> Self {
         let mut data = Self {
             thread_id: None,
+            pull_request_url: None,
             values: BTreeMap::new(),
         };
         for item in StatusSurfacePreviewItem::iter() {
@@ -246,7 +248,7 @@ impl StatusSurfacePreviewData {
         &self,
         items: I,
         use_theme_colors: bool,
-    ) -> Option<Line<'static>>
+    ) -> Option<FooterContent>
     where
         I: IntoIterator<Item = StatusLineItem>,
     {
@@ -258,9 +260,10 @@ impl StatusSurfacePreviewData {
             segments,
             use_theme_colors,
             self.thread_id,
-            /*pull_request_url*/ None,
+            self.live_value_for(StatusSurfacePreviewItem::PullRequestNumber)
+                .and(self.pull_request_url.as_deref()),
         )
-        .map(|line| line.line)
+        .map(FooterContent::HyperlinkLine)
     }
 }
 
