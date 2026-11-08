@@ -2,6 +2,21 @@ use super::*;
 use pretty_assertions::assert_eq;
 
 #[test]
+fn rate_limit_warning_opt_out_parses_and_preserves_default() {
+    for (source, expected) in [
+        ("", None),
+        ("hide_rate_limit_warnings = false", Some(false)),
+        ("hide_rate_limit_warnings = true", Some(true)),
+    ] {
+        let notice: Notice = toml::from_str(source).unwrap();
+        assert_eq!(notice.hide_rate_limit_warnings, expected);
+        assert_eq!(notice.hide_rate_limit_model_nudge, None);
+        let round_trip: Notice = toml::from_str(&toml::to_string(&notice).unwrap()).unwrap();
+        assert_eq!(round_trip, notice);
+    }
+}
+
+#[test]
 fn plugin_activation_inherits_defaults_without_explicit_enablement() {
     for default_enabled in [None, Some(false), Some(true)] {
         let default_config = default_enabled.map_or_else(String::new, |enabled| {
